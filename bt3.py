@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import tensorflow as tf
 from ultralytics import YOLO
+import dlib  # Import dlib for object tracking
 
 # Check if GPU is available and being used
 print("Num GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
@@ -16,12 +17,32 @@ paused = False
 playback_speed = 1.0  # Default playback speed (1.0 = normal speed)
 frame_delay = int(1000 / cap.get(cv2.CAP_PROP_FPS) * playback_speed)
 
+# Create dlib's correlation tracker
+tracker = dlib.correlation_tracker()
 
-# Define function to draw bounding boxes on frames
+# Define function to draw bounding boxes and track objects
 def draw_boxes_and_alert(frame, detections):
     height, width, _ = frame.shape
-    alert_distance_horizontal = width * 0.01  # Horizontal proximity threshold (e.g., left or right)
-    alert_distance_vertical = height * 0.3  # Vertical proximity threshold (e.g., front)
+    boxes = []
+
+    # Define the hood rectangle (This is for the front hood of the car)
+    hood_top = height - 170  # Top position, making it taller
+    hood_bottom = height - 0  # Bottom position, keeping it large vertically
+    hood_left = width // 6  # Move left further (1/6 of width)
+    hood_right = 5 * width // 6  # Move right further (5/6 of width), to make it much wider
+
+    # Define extra proximity boundary around the hood (to detect objects that come too close)
+    proximity_top = hood_top - 170  # Adding some distance above the hood
+    proximity_bottom = hood_bottom + 50  # Adding some distance below the hood
+    proximity_left = hood_left - 150  # Adding some distance to the left
+    proximity_right = hood_right + 150  # Adding some distance to the right
+
+    # Draw the hood rectangle (this will be ignored during object detection)
+    cv2.rectangle(frame, (hood_left, hood_top), (hood_right, hood_bottom), (0, 0, 255), 3)
+    cv2.putText(frame, "Ego Vehicle Hood", (hood_left, hood_top - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+
+    # Draw the proximity boundary (extra area around the hood for "too close" detection)
+    cv2.rectangle(frame, (proximity_left, proximity_top), (proximity_right, proximity_bottom), (0, 255, 255), 2)
 
     for detection in detections:
         for i in range(len(detection.boxes)):
@@ -30,43 +51,41 @@ def draw_boxes_and_alert(frame, detections):
             conf = detection.boxes[i].conf[0]
             label = detection.names[int(detection.boxes[i].cls[0])]
 
-            box_height = y2 - y1
+            # Skip if the object is inside the hood rectangle
+            if x1 > hood_left and y1 > hood_top and x2 < hood_right and y2 < hood_bottom:
+                continue  # Skip this object if it is inside the hood
 
-            # Calculate bounding box center and size
-            box_center_x = (x1 + x2) // 2
-            box_center_y = (y1 + y2) // 2
-            box_width = x2 - x1
-            box_height = y2 - y1
+            # Check if the object is within the proximity boundary
+            too_close = False
+            if proximity_left <= x1 <= proximity_right and proximity_top <= y1 <= proximity_bottom:
+                too_close = True
+                # Determine left or right side proximity
+                if x1 < width // 2:
+                    side = "LEFT"
+                else:
+                    side = "RIGHT"
+                # Flash the "LEFT" or "RIGHT" text on the screen
+                cv2.putText(frame, f"{side}", (width // 2 - 100, height // 2), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+                color = (0, 0, 255)  # Red for objects too close
+            else:
+                color = (0, 255, 0)  # Green for valid objects
 
-            if (
-                box_center_y > height * 0.7  # Near bottom
-                and abs(box_center_x - width // 2) < width * 0.3  # Near center horizontally
-                and (x2 - x1) * (y2 - y1) > (width * height) * 0.2  # Large area
-            ):
-                continue 
-
-            # Check if object is "too close" horizontally or vertically
-            too_close_horizontal = (
-                box_center_x < alert_distance_horizontal or box_center_x > width - alert_distance_horizontal
-            )
-            too_close_vertical = box_center_y > height - alert_distance_vertical
-
-            # Trigger alert if object is too close in either dimension
-            too_close = too_close_horizontal or too_close_vertical
-
-            # Draw bounding box with red if too close, green otherwise
-            color = (0, 0, 255) if too_close else (0, 255, 0)
+            # Draw bounding box and label for this object
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            # Add label, confidence score, and alert if too close
             text = f"{label}: {conf:.2f}"
-            if too_close:
-                print(f"ALERT: {label} is too close! Position: ({box_center_x}, {box_center_y})")
-                text += " (TOO CLOSE!)"
-                cv2.putText(frame, "WARNING: Object Too Close!", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
-
             cv2.putText(frame, text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
+            # Initialize the tracker for this object (only for the first detection)
+            if len(boxes) == 0:
+                tracker.start_track(frame, dlib.rectangle(x1, y1, x2, y2))
+                boxes.append((x1, y1, x2, y2))
+
+    # Update tracker for the current frame
+    if len(boxes) > 0:
+        tracker.update(frame)
+        tracked_position = tracker.get_position()
+        cv2.rectangle(frame, (int(tracked_position.left()), int(tracked_position.top())),
+                      (int(tracked_position.right()), int(tracked_position.bottom())), (255, 0, 0), 2)
 
 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
@@ -82,8 +101,8 @@ while cap.isOpened():
     # Draw bounding boxes and labels for all detected objects
     draw_boxes_and_alert(frame, results)
 
-    # Display the frame with detections
-    cv2.imshow('Car Object Detection', frame)
+    # Display the frame with detections and tracking
+    cv2.imshow('Car Object Detection with Tracking', frame)
 
     # Break loop if 'q' is pressed
     key = cv2.waitKey(frame_delay) & 0xFF
@@ -104,6 +123,7 @@ while cap.isOpened():
         cap.set(cv2.CAP_PROP_POS_FRAMES, min(current_frame + frame_step, total_frames - 1))
     elif key == ord('b'):  # Step backward
         cap.set(cv2.CAP_PROP_POS_FRAMES, max(current_frame - frame_step, 0))
+
 # Release video capture and close OpenCV windows
 cap.release()
 cv2.destroyAllWindows()
